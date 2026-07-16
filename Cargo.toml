@@ -1,0 +1,18 @@
+[package]
+name = "platformer"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["avian2d"]
+avian2d = ["tnua-demos-crate/avian2d"]
+rapier2d = []
+egui = []
+
+[dependencies]
+bevy = "0.19"
+avian2d = "0.7"
+bevy-tnua = "0.32"
+bevy-tnua-avian2d = "0.12"
+
+tnua-demos-crate = { path = "./tnua_demos_crate", features = ["avian2d"] }
