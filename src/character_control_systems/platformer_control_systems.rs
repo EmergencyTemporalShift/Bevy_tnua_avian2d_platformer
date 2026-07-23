@@ -1,0 +1,817 @@
+use std::cmp::Ordering;
+
+use bevy::{
+    app::{FixedMain, RunFixedMainLoop},
+    prelude::*,
+};
+#[cfg(feature = "egui")]
+use bevy_inspector_egui::bevy_egui::{EguiContexts, egui};
+use bevy_tnua::{
+    TnuaGhostOverwrites, TnuaGhostSensor, TnuaSensorsEntities,
+    control_helpers::TnuaActionsCounter,
+    math::{AdjustPrecision, AsF32, Float, Quaternion, Vector3},
+};
+use bevy_tnua::{TnuaObstacleRadar, prelude::*};
+use bevy_tnua::{
+    builtins::TnuaBuiltinCrouchMemory,
+    radar_lens::{TnuaBlipSpatialRelation, TnuaRadarLens},
+};
+use bevy_tnua::{
+    builtins::{TnuaBuiltinClimb, TnuaBuiltinDash, TnuaBuiltinWallSlide},
+    control_helpers::TnuaBlipReuseAvoidance,
+};
+use bevy_tnua::{
+    builtins::{TnuaBuiltinJump, TnuaBuiltinWalk},
+    control_helpers::TnuaSimpleFallThroughPlatformsHelper,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    character_control_systems::platformer_control_scheme::{
+        DemoControlSchemeActionDiscriminant, DemoControlSchemeActionState, SlowDownWhileCrouching,
+    },
+    ui::tuning::UiTunable,
+};
+
+pub use super::{
+    Dimensionality,
+    platformer_control_scheme::{
+        CharacterMotionConfigForPlatformerDemo, DemoControlSchemeAirActions,
+    },
+};
+use super::{platformer_control_scheme::DemoControlScheme, querying_helpers::ObstacleQueryHelper};
+use super::{
+    platformer_control_scheme::DemoControlSchemeConfig, spatial_ext_facade::SpatialExtFacade,
+};
+
+#[allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::useless_conversion
+)]
+pub fn apply_platformer_controls(
+    #[cfg(feature = "egui")] mut egui_context: EguiContexts,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut just_pressed: ResMut<JustPressedCache>,
+    mut query: Query<(
+        // This is the main component used for interacting with Tnua. It is used for both issuing
+        // commands and querying the character's state.
+        &mut TnuaController<DemoControlScheme>,
+        // And handle for the configuration. We need this because we store in the config (using
+        // `config_ext`) a `CharacterMotionConfigForPlatformerDemo` which we need to determine how
+        // to operate this control system.
+        &TnuaConfig<DemoControlScheme>,
+        &TnuaSensorsEntities<DemoControlScheme>,
+        // The ghost sensor detects ghost platforms - which are pass-through platforms marked with
+        // the `TnuaGhostPlatform` component. Left alone it does not actually affect anything - a
+        // user control system (like this very demo here) has to use the data from it and
+        // manipulate the proximity sensor.
+        &mut TnuaGhostOverwrites<DemoControlScheme>,
+        // This is a helper for implementing one-way platforms.
+        &mut TnuaSimpleFallThroughPlatformsHelper,
+        // This is a helper for implementing air actions.
+        &TnuaActionsCounter<DemoControlSchemeAirActions>,
+        // This is a helper for tracking where the camera is looking at
+        (
+            Option<&CameraControllerFloating>,
+            Option<&CameraControllerMounted>,
+        ),
+        // This is used to detect all the colliders in a small area around the character.
+        &TnuaObstacleRadar,
+        // This is used to avoid re-initiating actions on the same obstacles until we return to
+        // them.
+        &mut TnuaBlipReuseAvoidance<DemoControlScheme>,
+    )>,
+    config_assets: Res<Assets<DemoControlSchemeConfig>>,
+    // This is used to run spatial queries on the physics backend. Note that `SpatialExtFacade` is
+    // defined in the demos crates, and actual games that use Tnua should instead use the
+    // appropriate type from the physics backend integration crate they use - e.g.
+    // `TnuaSpatialExtAvian2d` or `TnuaSpatialExtRapier3d`.
+    spatial_ext: SpatialExtFacade,
+    // This is used to determine the qualities of the obstacles (e.g. whether they are climbable)
+    obstacle_query: Query<ObstacleQueryHelper>,
+    // The proximity sensor usually works behind the scenes, but we need it here because
+    // manipulating the proximity sensor using data from the ghost sensor is how one-way platforms
+    // work in Tnua. &mut TnuaProximitySensor,
+    ghost_sensors_query: Query<&TnuaGhostSensor>,
+    #[cfg(feature = "egui")]
+    mut is_egui_initialized: Local<bool>,
+) {
+    #[cfg(feature = "egui")]
+    {
+        if !*is_egui_initialized {
+            *is_egui_initialized = true;
+        } else if let Ok(ctx) = egui_context.ctx_mut() {
+            if ctx.egui_wants_keyboard_input() {
+                for (mut controller, ..) in query.iter_mut() {
+                    // The basis remembers its last frame status, so if we cannot feed it proper input this
+                    // frame (for example, because the GUI takes the input focus), we need to neutralize it.
+                    controller.basis = Default::default();
+                }
+                return;
+            }
+        }
+    }
+
+    for (
+        mut controller,
+        config,
+        sensors_entities,
+        mut ghost_overwrites,
+        mut fall_through_helper,
+        air_actions,
+        camera_controller,
+        obstacle_radar,
+        mut blip_reuse_avoidance,
+    ) in query.iter_mut()
+    {
+        let Some(config) = config_assets.get(&config.0) else {
+            continue;
+        };
+        controller.initiate_action_feeding();
+        let up_direction = controller.up_direction().unwrap_or(Dir3::Y);
+
+        // This part is just keyboard input processing. In a real game this would probably be done
+        // with a third party plugin.
+        let mut direction = Vector3::ZERO;
+
+        let is_climbing =
+            controller.action_discriminant() == Some(DemoControlSchemeActionDiscriminant::Climb);
+
+        if config.ext.dimensionality == Dimensionality::Dim3 || is_climbing {
+            if keyboard.any_pressed([KeyCode::ArrowUp, KeyCode::KeyW]) {
+                direction -= Vector3::Z;
+            }
+            if keyboard.any_pressed([KeyCode::ArrowDown, KeyCode::KeyS]) {
+                direction += Vector3::Z;
+            }
+        }
+        if keyboard.any_pressed([KeyCode::ArrowLeft, KeyCode::KeyA]) {
+            direction -= Vector3::X;
+        }
+        if keyboard.any_pressed([KeyCode::ArrowRight, KeyCode::KeyD]) {
+            direction += Vector3::X;
+        }
+
+        let screen_space_direction = direction.clamp_length_max(1.0);
+
+        let transform_for_controls = match camera_controller {
+            (None, None) => None,
+            (None, Some(camera)) => Some(camera as &dyn CameraController),
+            (Some(camera), None) => Some(camera as &dyn CameraController),
+            (Some(_), Some(_)) => panic!("both floating and mounted cameras at the same time"),
+        }
+        .map(|c| c.calculate_transform_for_controls(Dir3::NEG_Z, up_direction))
+        .unwrap_or_default();
+        let direction = transform_for_controls
+            .transform_point(screen_space_direction.f32())
+            .adjust_precision();
+
+        let jump = match (config.ext.dimensionality, is_climbing) {
+            (Dimensionality::Dim2, true) => keyboard.any_pressed([KeyCode::Space]),
+            (Dimensionality::Dim2, false) => {
+                keyboard.any_pressed([KeyCode::Space, KeyCode::ArrowUp, KeyCode::KeyW])
+            }
+            (Dimensionality::Dim3, _) => keyboard.any_pressed([KeyCode::Space]),
+        };
+        let dash = keyboard.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+
+        let has_mounted_camera = {
+            let mounted_camera_controller: &Option<&CameraControllerMounted> = &camera_controller.1;
+            mounted_camera_controller.is_some()
+        };
+        let turn_in_place =
+            !has_mounted_camera && keyboard.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+
+        let crouch_buttons = match (config.ext.dimensionality, is_climbing) {
+            (Dimensionality::Dim2, true) => CROUCH_BUTTONS_3D.iter().copied(),
+            (Dimensionality::Dim2, false) => CROUCH_BUTTONS_2D.iter().copied(),
+            (Dimensionality::Dim3, _) => CROUCH_BUTTONS_3D.iter().copied(),
+        };
+        let crouch_pressed = keyboard.any_pressed(crouch_buttons);
+        let crouch_just_pressed = just_pressed.crouch;
+        just_pressed.was_read = true;
+
+        // This also needs to be called once per frame. It checks which obstacles needs to be
+        // blocked - e.g. because we've just finished an action on them, and we don't want to
+        // reinitiate that action.
+        blip_reuse_avoidance.update(controller.as_ref(), obstacle_radar);
+
+        // Here we will handle one-way platforms. It looks long and complex, but it's actual
+        // several schemes with observable changes in behavior, and each implementation is rather
+        // short and simple.
+        let crouch;
+        if let Some(ghost_sensor) = sensors_entities
+            .ground
+            .and_then(|entity| ghost_sensors_query.get(entity).ok())
+        {
+            match config.ext.falling_through {
+                // With this scheme, the player cannot make their character fall through by pressing
+                // the crouch button - the platforms are jump-through only.
+                FallingThroughControlScheme::JumpThroughOnly => {
+                    crouch = crouch_pressed;
+                    // To achieve this, we simply take the first platform detected by the ghost sensor,
+                    // and treat it like a "real" platform.
+                    ghost_overwrites
+                        .ground
+                        // By overriding the sensor's output, we make it pretend the ghost platform
+                        // is a real one - which makes Tnua make the character stand on it even
+                        // though the physics engine will not consider them colliding with each
+                        // other.
+                        .set(ghost_sensor.iter().find(|ghost_platform| {
+                            // Ghost platforms do not interact with the character through the
+                            // physics engine. Additionally, the ray that detects them starts from
+                            // the center of the character. Therefore, we usually want to focus only
+                            // on platforms that are at least a certain distance lower than the
+                            // character's center. This limitation helps control the specific point
+                            // from which the character begins climbing when they collide with a
+                            // platform.
+                            config.ext.one_way_platforms_min_proximity <= ghost_platform.proximity
+                        }));
+                }
+                // With this scheme, the player can drop down one-way platforms by pressing the crouch
+                // button. Because it does not use `TnuaSimpleFallThroughPlatformsHelper`, it has
+                // certain limitations:
+                //
+                // 1. If the player releases the crouch button before the character has passed a
+                //    certain distance it'll climb back up on the platform.
+                // 2. If a ghost platform sits too close above another platform (whether ghost or
+                // solid), a specific issue occurs. When the character floats above the lower
+                // platform, the higher one gets detected at very close range. As a result, the
+                // character will climb back up to the higher platform. This happens even if the
+                // user explicitly dropped from the higher platform to the lower one.
+                //
+                // Both limitations are greatly affected by the min proximity, but setting it tightly
+                // to minimize them may cause the character to sometimes fall through a ghost platform
+                // without explicitly being told to. To properly overcome these limitations - use
+                // `TnuaSimpleFallThroughPlatformsHelper`.
+                FallingThroughControlScheme::WithoutHelper => {
+                    // With this scheme we only care about the first ghost platform the ghost sensor
+                    // finds with a proximity higher than the defined minimum. We either treat it as a
+                    // real platform, or ignore it and any other platform the sensor has found.
+                    let relevant_platform = ghost_sensor.iter().find(|ghost_platform| {
+                        config.ext.one_way_platforms_min_proximity <= ghost_platform.proximity
+                    });
+                    if crouch_pressed {
+                        // If there is a ghost platform, it means the player wants to fall through it -
+                        // so we "cancel" the crouch, and we don't pass any ghost platform to the
+                        // proximity sensor (because we want to character to fall through).
+                        //
+                        // If there is no ghost platform, it means the character is standing on a real
+                        // platform - so we make it crouch. We don't pass any ghost platform to the
+                        // proximity sensor here either - because there aren't any.
+                        crouch = relevant_platform.is_none();
+                        ghost_overwrites.ground.set(None);
+                    } else {
+                        crouch = false;
+                        // Ghost platforms can only be detected _before_ fully solid platforms, so
+                        // if we detect one we can safely replace the proximity sensor's output
+                        // with it.
+                        //
+                        // Do take care to only do this when there is a ghost platform though -
+                        // otherwise it could replace an actual solid platform detection with a
+                        // `None`.
+                        ghost_overwrites.ground.set(relevant_platform);
+                    }
+                }
+                // This scheme uses `TnuaSimpleFallThroughPlatformsHelper` to properly handle fall
+                // through:
+                //
+                // * Pressing the crouch button while standing on a ghost platform will make the
+                //   character fall through it.
+                // * Even if the button is released immediately, the character will not climb back up.
+                //   It'll continue the fall.
+                // * Even if the button is held and there is another ghost platform below, the
+                //   character will only drop one "layer" of ghost platforms.
+                // * If the player drops from a ghost platform to a platform too close to it - the
+                //   character will not climb back up. The player can still climb back up by jumping,
+                //   of course.
+                FallingThroughControlScheme::SingleFall => {
+                    // The fall through helper is operated by creating a handler.
+                    let mut handler = fall_through_helper.with(
+                        &mut ghost_overwrites.ground,
+                        ghost_sensor,
+                        config.ext.one_way_platforms_min_proximity,
+                    );
+                    if crouch_pressed {
+                        // Use `try_falling` to fall through the first ghost platform. It'll return
+                        // `true` if there really was a ghost platform to fall through - in which case
+                        // we want to cancel the crouch. If there was no ghost platform to fall
+                        // through, it returns `false` - in which case we do want to crouch.
+                        //
+                        // The boolean argument to `try_falling` determines if the character should
+                        // fall through "new" ghost platforms. When the player have just pressed the
+                        // crouch button, we pass `true` so that the fall can begin. But in the
+                        // following frames we pass `false` so that if there are more ghost platforms
+                        // below the character will not fall through them.
+                        crouch = !handler.try_falling(crouch_just_pressed);
+                    } else {
+                        crouch = false;
+                        // Use `dont_fall` to not fall. If there are platforms that the character
+                        // already stared falling through, it'll continue the fall through and not
+                        // climb back up (like it would with the `WithoutHelper` scheme). Otherwise, it
+                        // will just copy the first ghost platform (above the min proximity) from the
+                        // ghost sensor to the proximity sensor.
+                        handler.dont_fall();
+                    }
+                }
+                // This scheme is similar to `SingleFall`, with the exception that as long as the
+                // crouch button is pressed the character will keep falling through ghost platforms.
+                FallingThroughControlScheme::KeepFalling => {
+                    let mut handler = fall_through_helper.with(
+                        &mut ghost_overwrites.ground,
+                        ghost_sensor,
+                        config.ext.one_way_platforms_min_proximity,
+                    );
+                    if crouch_pressed {
+                        // This is done by passing `true` to `try_falling`, allowing it to keep falling
+                        // through new platforms even if the button was not _just_ pressed.
+                        crouch = !handler.try_falling(true);
+                    } else {
+                        crouch = false;
+                        handler.dont_fall();
+                    }
+                }
+            };
+        } else {
+            crouch = crouch_pressed;
+        }
+
+        let slow_down_while_crouching = SlowDownWhileCrouching(
+            // `TnuaController::current_action` can be used to determine if an action is currently
+            // running, and query its status. Here, we use it to check if the character is
+            // currently crouching, so that we can limit its speed.
+            if let Some(DemoControlSchemeActionState::Crouch(state, _)) =
+                controller.current_action.as_ref()
+            {
+                // If the crouch is finished (last stages of standing up) we don't need to slow the
+                // character down.
+                !matches!(state.memory, TnuaBuiltinCrouchMemory::Rising)
+            } else {
+                false
+            },
+        );
+
+        // The basis is Tnua's most fundamental control command, governing over the character's
+        // regular movement. The basis (and, to some extent, the actions as well) contains both
+        // configuration - which in this case we copy over from `config.walk` - and controls like
+        // `desired_velocity` or `desired_forward` which we compute here based on the current
+        // frame's input.
+        controller.basis = TnuaBuiltinWalk {
+            desired_motion: if turn_in_place {
+                Vector3::ZERO
+            } else {
+                direction
+            },
+            desired_forward: if let Some(CameraControllerMounted { forward, .. }) =
+                camera_controller.1
+            {
+                // With shooters, we want the character model to follow the camera.
+                Dir3::new(forward.f32()).ok()
+            } else {
+                // For platformers, we only want ot change direction when the character tries to
+                // move (or when the player explicitly wants to set the direction)
+                Dir3::new(direction.f32()).ok()
+            },
+        };
+
+        let radar_lens = TnuaRadarLens::new(obstacle_radar, &spatial_ext);
+
+        let already_sliding_on = if let Some(DemoControlSchemeActionState::WallSlide(_, entity)) =
+            controller.current_action.as_ref()
+            && obstacle_radar.has_blip(*entity)
+        {
+            Some(*entity)
+        } else {
+            None
+        };
+
+        let already_climbing_on =
+            if let Some(DemoControlSchemeActionState::Climb(state, entity, initiation_direction)) =
+                controller.current_action.as_ref()
+                && obstacle_radar.has_blip(*entity)
+            {
+                Some((*entity, state.input.clone(), *initiation_direction))
+            } else {
+                None
+            };
+
+        let mut walljump_candidate = None;
+
+        'blips_loop: for blip in radar_lens.iter_blips() {
+            if !blip_reuse_avoidance.should_avoid(blip.entity())
+                && obstacle_query
+                    .get(blip.entity())
+                    .expect("ObstacleQueryHelper has nothing that could fail when missing")
+                    .climbable
+            {
+                if let Some((climbable_entity, action, initiation_direction)) =
+                    already_climbing_on.as_ref()
+                {
+                    if *climbable_entity != blip.entity() {
+                        continue 'blips_loop;
+                    }
+                    let dot_initiation = direction.dot(*initiation_direction);
+                    let initiation_direction = if 0.5 < dot_initiation {
+                        *initiation_direction
+                    } else {
+                        Vector3::ZERO
+                    };
+                    if initiation_direction == Vector3::ZERO {
+                        let right_left = screen_space_direction.dot(Vector3::X);
+                        if 0.5 <= right_left.abs() {
+                            continue 'blips_loop;
+                        }
+                    }
+
+                    let mut action = TnuaBuiltinClimb {
+                        anchor: blip.closest_point().get(),
+                        desired_climb_motion: screen_space_direction.dot(Vector3::NEG_Z)
+                            * Vector3::Y,
+                        desired_vec_to_anchor: action.desired_vec_to_anchor,
+                        desired_forward: action.desired_forward,
+                        ..Default::default()
+                    };
+
+                    const LOOK_ABOVE_OR_BELOW: Float = 5.0;
+                    match action
+                        .desired_climb_motion
+                        .dot(Vector3::Y)
+                        .partial_cmp(&0.0)
+                        .unwrap()
+                    {
+                        Ordering::Less => {
+                            if controller.is_airborne().unwrap() {
+                                let extent = blip
+                                    .probe_extent_from_closest_point(-Dir3::Y, LOOK_ABOVE_OR_BELOW);
+                                if extent < 0.9 * LOOK_ABOVE_OR_BELOW {
+                                    action.hard_stop_down =
+                                        Some(blip.closest_point().get() - extent * Vector3::Y);
+                                }
+                            } else if initiation_direction == Vector3::ZERO {
+                                continue 'blips_loop;
+                            } else {
+                                action.desired_climb_motion = Vector3::ZERO;
+                            }
+                        }
+                        Ordering::Equal => {}
+                        // Climbing up
+                        Ordering::Greater => {
+                            let extent =
+                                blip.probe_extent_from_closest_point(Dir3::Y, LOOK_ABOVE_OR_BELOW);
+                            if extent < 0.9 * LOOK_ABOVE_OR_BELOW {
+                                action.hard_stop_up =
+                                    Some(blip.closest_point().get() + extent * Vector3::Y);
+                            }
+                        }
+                    }
+
+                    controller.action(DemoControlScheme::Climb(
+                        action,
+                        blip.entity(),
+                        initiation_direction,
+                    ));
+                } else if let TnuaBlipSpatialRelation::Aeside(blip_direction) =
+                    blip.spatial_relation(0.5)
+                    && 0.5 < direction.dot(blip_direction.adjust_precision())
+                {
+                    let direction_to_anchor = match config.ext.dimensionality {
+                        Dimensionality::Dim2 => Vector3::ZERO,
+                        Dimensionality::Dim3 => -blip
+                            .normal_from_closest_point()
+                            .reject_from_normalized(Vector3::Y),
+                    };
+                    controller.action(DemoControlScheme::Climb(
+                        TnuaBuiltinClimb {
+                            anchor: blip.closest_point().get(),
+                            desired_vec_to_anchor: 0.5 * direction_to_anchor,
+                            desired_forward: Dir3::new(direction_to_anchor.f32()).ok(),
+                            ..Default::default()
+                        },
+                        blip.entity(),
+                        direction.normalize_or_zero(),
+                    ));
+                }
+            }
+            if !blip.is_interactable() {
+                continue;
+            }
+            match blip.spatial_relation(0.5) {
+                TnuaBlipSpatialRelation::Invalid => {}
+                TnuaBlipSpatialRelation::Above => {}
+                TnuaBlipSpatialRelation::Below => {}
+                TnuaBlipSpatialRelation::Aeside(blip_direction) => {
+                    let dot_threshold = if Some(blip.entity()) == already_sliding_on {
+                        -0.1
+                    } else {
+                        0.0
+                    };
+                    if controller.is_airborne().unwrap() {
+                        let dot_direction = direction.dot(blip_direction.adjust_precision());
+
+                        if Some(blip.entity()) == already_sliding_on {
+                            walljump_candidate = Some((blip.entity(), -blip_direction));
+                        }
+
+                        if dot_threshold < dot_direction
+                            && 0.8 < blip.flat_wall_score(Dir3::Y, &[-1.0, 1.0])
+                        {
+                            let Ok(normal) = Dir3::new(blip.normal_from_closest_point().f32())
+                            else {
+                                continue;
+                            };
+                            controller.action(DemoControlScheme::WallSlide(
+                                TnuaBuiltinWallSlide {
+                                    contact_point_with_wall: blip.closest_point().get(),
+                                    normal,
+                                    force_forward: Some(blip_direction),
+                                },
+                                blip.entity(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if crouch {
+            // Crouching is an action. We either feed it or we don't - other than that there is
+            // nothing to set from the current frame's input. We do pass it through the crouch
+            // enforcer though, which makes sure the character does not stand up if below an
+            // obstacle.
+            controller.action(DemoControlScheme::Crouch(
+                Default::default(),
+                slow_down_while_crouching,
+            ));
+        }
+
+        if jump {
+            let action_flow_status = controller.action_flow_status().clone();
+            if matches!(
+                action_flow_status.ongoing(),
+                Some(
+                    DemoControlSchemeActionDiscriminant::Jump
+                        | DemoControlSchemeActionDiscriminant::WallJump
+                )
+            ) {
+                controller.prolong_action();
+            } else if let Some((_, walljump_direction)) = walljump_candidate {
+                controller.action(DemoControlScheme::WallJump(TnuaBuiltinJump {
+                    horizontal_displacement: Some(walljump_direction.adjust_precision()),
+                    allow_in_air: true,
+                    force_forward: Some(-walljump_direction),
+                }));
+            } else {
+                let current_action_discriminant = controller.action_discriminant();
+                controller.action(DemoControlScheme::Jump(TnuaBuiltinJump {
+                    // Jumping, like crouching, is an action that we either feed or don't. However,
+                    // because it can be used in midair, we want to set its `allow_in_air`. The air
+                    // counter helps us with that.
+                    //
+                    // The air actions counter determines if an action is allowed midair. It works
+                    // by counting how many actions have been performed since the character was last
+                    // considered "grounded." This count includes the first jump if it was executed
+                    // from the ground. It also includes the moment a free fall begins.
+                    //
+                    // `count_for` needs the discriminant of the action to be performed (in this
+                    // case `DemoControlSchemeActionDiscriminant::Jump`) because it needs to know
+                    // which slot to use and because if the player is still holding the jump
+                    // button, we want it to be considered as the same jump action number. So, if
+                    // the player performs an air jump, before the `Jump` action becomes the active
+                    // action in the controller `count_for` will return 1 for any action on the
+                    // jump slot, but after it, it'll return 1 only for
+                    // `DemoControlSchemeActionDiscriminant::Jump` (maintaining the jump) and 2 for
+                    // any other action. Of course, if the player releases the button and presses
+                    // it again it'll return 2.
+                    allow_in_air: air_actions.count_for(DemoControlSchemeActionDiscriminant::Jump)
+                        <= config.ext.jumps_in_air
+                        // We also want to be able to jump from a climb.
+                        || current_action_discriminant == Some(DemoControlSchemeActionDiscriminant::Climb),
+                    ..Default::default()
+                }));
+            }
+        }
+
+        if dash {
+            controller.action(DemoControlScheme::Dash(TnuaBuiltinDash {
+                // Dashing is also an action, but because it has directions we need to provide said
+                // directions. `displacement` is a vector that determines where the jump will bring
+                // us. Note that even after reaching the displacement, the character may still have
+                // some leftover velocity (configurable with the other parameters of the action).
+                //
+                // The displacement is "frozen" when the action starts - user code does not have to
+                // worry about storing the original direction.
+                displacement: direction.normalize()
+                    // Add a vertical component upward which can be controlled by the
+                    // `vertical_distance` field of the configuration.
+                    + up_direction.adjust_precision(),
+                // When set, the `desired_forward` of the dash action "overrides" the
+                // `desired_forward` of the walk basis. Like the displacement, it gets "frozen" -
+                // allowing to easily maintain a forward direction during the dash.
+                desired_forward: if has_mounted_camera {
+                    // For shooters, we want to allow rotating mid-dash if the player moves the
+                    // mouse.
+                    None
+                } else {
+                    Dir3::new(direction.f32()).ok()
+                },
+                allow_in_air: air_actions.count_for(DemoControlSchemeActionDiscriminant::Dash)
+                    <= config.ext.dashes_in_air,
+            }));
+        }
+    }
+}
+
+impl UiTunable for CharacterMotionConfigForPlatformerDemo {
+    #[cfg(feature = "egui")]
+    fn tune(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::Slider::new(&mut self.jumps_in_air, 0..=8).text("Max Jumps in Air"));
+        ui.add(egui::Slider::new(&mut self.dashes_in_air, 0..=8).text("Max Dashes in Air"));
+        // TODO: dash distance should be moved to TnuaBuiltinDashConfig
+        ui.collapsing("One-way Platforms", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.one_way_platforms_min_proximity, 0.0..=2.0)
+                    .text("Min Proximity"),
+            );
+            self.falling_through.tune(ui);
+        });
+    }
+}
+
+impl UiTunable for DemoControlSchemeConfig {
+    #[cfg(feature = "egui")]
+    fn tune(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Walking:", |ui| {
+            self.basis.tune(ui);
+        });
+        ui.collapsing("Jumping:", |ui| {
+            self.jump.tune(ui);
+        });
+        ui.collapsing("Dashing:", |ui| {
+            self.dash.tune(ui);
+        });
+        ui.collapsing("Crouching:", |ui| {
+            self.crouch.tune(ui);
+        });
+        ui.collapsing("Knockback:", |ui| {
+            self.knockback.tune(ui);
+        });
+        ui.collapsing("Wall Slide:", |ui| {
+            self.wall_slide.tune(ui);
+        });
+        ui.collapsing("Wall Jump:", |ui| {
+            self.wall_jump.tune(ui);
+        });
+        ui.collapsing("Climb", |ui| {
+            self.climb.tune(ui);
+        });
+        self.ext.tune(ui);
+    }
+}
+
+#[derive(Component, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum FallingThroughControlScheme {
+    JumpThroughOnly,
+    WithoutHelper,
+    #[default]
+    SingleFall,
+    KeepFalling,
+}
+
+impl UiTunable for FallingThroughControlScheme {
+    #[cfg(feature = "egui")]
+    fn tune(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_label("Falling Through Control Scheme")
+            .selected_text(format!("{:?}", self))
+            .show_ui(ui, |ui| {
+                for variant in [
+                    FallingThroughControlScheme::JumpThroughOnly,
+                    FallingThroughControlScheme::WithoutHelper,
+                    FallingThroughControlScheme::SingleFall,
+                    FallingThroughControlScheme::KeepFalling,
+                ] {
+                    if ui
+                        .selectable_label(*self == variant, format!("{:?}", variant))
+                        .clicked()
+                    {
+                        *self = variant;
+                    }
+                }
+            });
+    }
+}
+
+pub trait CameraController {
+    fn camera_forward(&self) -> Vector3;
+
+    /// A handy function to create a transformation from screen space direction into the forward
+    /// direction of the camera. The screen space direction is typically just `Vec3::NEG_Z`;
+    fn calculate_transform_for_controls(
+        &self,
+        screen_space_forward: Dir3,
+        player_up: Dir3,
+    ) -> Transform {
+        let forward = self
+            .camera_forward()
+            .reject_from(player_up.adjust_precision())
+            .normalize();
+        Transform::default().with_rotation(
+            Quaternion::from_rotation_arc(screen_space_forward.adjust_precision(), forward).f32(),
+        )
+    }
+}
+
+/// A camera controller that follows the player.
+#[derive(Component)]
+pub struct CameraControllerMounted {
+    pub forward: Vector3,
+    pub pitch_angle: Float,
+}
+
+impl Default for CameraControllerMounted {
+    fn default() -> Self {
+        Self {
+            forward: Vector3::NEG_Z,
+            pitch_angle: 0.0,
+        }
+    }
+}
+
+impl CameraController for CameraControllerMounted {
+    fn camera_forward(&self) -> Vector3 {
+        self.forward.adjust_precision()
+    }
+}
+
+/// A fixed camera that is located at `from` and looks at `to`. The camera position is updated via
+/// the UI (requires the "egui" feature)
+#[derive(Component)]
+pub struct CameraControllerFloating {
+    pub looking_from: Vector3,
+    pub looking_to: Vector3,
+}
+
+impl CameraController for CameraControllerFloating {
+    fn camera_forward(&self) -> Vector3 {
+        self.looking_to - self.looking_from
+    }
+}
+
+/// Since the fixed timestep schedule does not cache just pressed states that happened
+/// in a frame with no fixed updates, we need to cache them ourselves in order to not miss them.
+/// Note that if you use a smarter input manager like LWIM, this is handled for you.
+/// If the demo is running with a variable timestep, this will just report the current frame's
+/// state as expected.
+pub struct JustPressedCachePlugin;
+
+impl Plugin for JustPressedCachePlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<JustPressedCache>();
+        app.add_systems(
+            RunFixedMainLoop,
+            (
+                collect_just_pressed_cache.before(FixedMain::run_fixed_main),
+                clear_just_pressed_cache.after(FixedMain::run_fixed_main),
+            ),
+        );
+    }
+}
+
+fn collect_just_pressed_cache(
+    query: Query<&TnuaConfig<DemoControlScheme>>,
+    config_assets: Res<Assets<DemoControlSchemeConfig>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut just_pressed: ResMut<JustPressedCache>,
+) {
+    for config in &query {
+        let Some(config) = config_assets.get(&config.0) else {
+            continue;
+        };
+        let crouch_buttons = match config.ext.dimensionality {
+            Dimensionality::Dim2 => CROUCH_BUTTONS_2D.iter().copied(),
+            Dimensionality::Dim3 => CROUCH_BUTTONS_3D.iter().copied(),
+        };
+        just_pressed.crouch = keyboard.any_just_pressed(crouch_buttons);
+    }
+}
+
+fn clear_just_pressed_cache(mut just_pressed: ResMut<JustPressedCache>) {
+    if just_pressed.was_read {
+        *just_pressed = default()
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct JustPressedCache {
+    crouch: bool,
+    was_read: bool,
+}
+
+const CROUCH_BUTTONS_2D: &[KeyCode] = &[
+    KeyCode::ControlLeft,
+    KeyCode::ControlRight,
+    KeyCode::ArrowDown,
+    KeyCode::KeyS,
+];
+
+const CROUCH_BUTTONS_3D: &[KeyCode] = &[KeyCode::ControlLeft, KeyCode::ControlRight];
