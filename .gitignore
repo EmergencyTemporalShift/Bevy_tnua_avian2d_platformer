@@ -1,0 +1,6 @@
+/.jackdaw
+/.idea/
+
+# Project exclude paths
+/jackdaw.toml
+/target/
