@@ -8,6 +8,6 @@ fn main() {
 
     App::new().add_plugins(default_plugins)
     // All gameplay lives in the library crate so the editor can link it too.
-    .add_plugins(platformer::GamePlugin)
+    .add_plugins(ambrosia::GamePlugin)
     .run();
 }

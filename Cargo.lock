@@ -220,6 +220,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ambrosia"
+version = "0.1.0"
+dependencies = [
+ "avian2d",
+ "bevy 0.19.0",
+ "bevy-inspector-egui",
+ "bevy-tnua",
+ "bevy-tnua-avian2d",
+ "bevy-tnua-physics-integration-layer",
+ "bevy_egui",
+ "bevy_framepace",
+ "bevy_hanabi",
+ "clap",
+ "egui",
+ "egui_extras",
+ "egui_plot",
+ "glamour",
+ "jackdaw_runtime",
+ "leafwing-input-manager",
+ "ordered-float",
+ "serde",
+ "web-sys",
+]
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7165,31 +7190,6 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
-
-[[package]]
-name = "platformer"
-version = "0.1.0"
-dependencies = [
- "avian2d",
- "bevy 0.19.0",
- "bevy-inspector-egui",
- "bevy-tnua",
- "bevy-tnua-avian2d",
- "bevy-tnua-physics-integration-layer",
- "bevy_egui",
- "bevy_framepace",
- "bevy_hanabi",
- "clap",
- "egui",
- "egui_extras",
- "egui_plot",
- "glamour",
- "jackdaw_runtime",
- "leafwing-input-manager",
- "ordered-float",
- "serde",
- "web-sys",
-]
 
 [[package]]
 name = "plotters"
