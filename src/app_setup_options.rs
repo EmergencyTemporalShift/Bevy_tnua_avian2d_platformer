@@ -33,15 +33,8 @@ impl AppSetupConfiguration {
             } else if cfg!(feature = "avian") {
                 ScheduleToUse::FixedUpdate
             } else {
-                #[cfg(feature = "avian")]
                 {
                     ScheduleToUse::FixedUpdate
-                }
-                #[cfg(not(feature = "avian"))]
-                {
-                    panic!(
-                        "No schedule was specified, but also no physics engine is available. Therefore, there is no fallback."
-                    )
                 }
             },
             level_to_load: url_params.get("level"),

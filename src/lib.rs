@@ -5,25 +5,21 @@
 //! can discover their reflected types; `main.rs` keeps only the window
 //! and ambient-plugin setup.
 
-use bevy::prelude::*;
-#[cfg(feature = "pie")]
-use jackdaw_runtime::prelude::*;
 use avian2d::prelude::*;
+use bevy::prelude::*;
+use bevy_hanabi::prelude::*;
 use bevy_tnua::control_helpers::TnuaAirActionsPlugin;
-//use bevy_inspector_egui::bevy_egui::{EguiContext, EguiPrimaryContextPass, PrimaryEguiContext};
-#[cfg(feature = "egui")]
-use {
-    bevy_egui::{EguiContext, EguiPrimaryContextPass, PrimaryEguiContext},
-    bevy_inspector_egui,
-};
-#[allow(unused_imports)]
-use bevy_tnua::math::{AsF32, Vector3, float_consts};
 use bevy_tnua::prelude::*;
 use bevy_tnua_avian2d::prelude::*;
-use levels_setup::helper::helper2d;
-use ui::DemoUi;
 
-use bevy_hanabi::prelude::*;
+#[allow(unused_imports)]
+use bevy_tnua::math::{float_consts, AsF32, Vector3};
+
+#[cfg(feature = "pie")]
+use jackdaw_runtime::prelude::*;
+
+#[cfg(feature = "egui")]
+use bevy_egui::EguiPrimaryContextPass;
 
 // --- Internal modules ---
 pub mod app_setup_options;
@@ -41,24 +37,37 @@ use crate::character_control_systems::info_dumping_systems::character_control_ra
 use crate::character_control_systems::platformer_control_scheme::{
     DemoControlScheme, DemoControlSchemeAirActions,
 };
-use crate::character_control_systems::platformer_control_systems::{JustPressedCachePlugin,
-                                                                   apply_platformer_controls,
+use crate::character_control_systems::platformer_control_systems::{
+    apply_platformer_controls, JustPressedCachePlugin,
 };
 use crate::level_mechanics::LevelMechanicsPlugin;
 use crate::levels_setup::level_switching::LevelSwitchingPlugin;
 use crate::levels_setup::levels_for_2d;
-use crate::living::LivingPlugin;
+use crate::levels_setup::helper::helper2d;
 use crate::living::enemy::EnemyPlugin;
 use crate::living::player::PlayerPlugin;
 use crate::living::weapon_shooting::FireWeapon;
+use crate::living::LivingPlugin;
+use crate::ui::DemoUi;
 use crate::util::controls_other::OtherControlsPlugin;
+use crate::util::game_states::{toggle_pause, GameState};
+use crate::util::particles::{pause_particle_spawners, unpause_particle_spawners, ParticlePlugin};
 
 #[cfg(feature = "egui")]
 use crate::character_control_systems::info_dumping_systems::character_control_info_dumping_system;
 #[cfg(feature = "egui")]
-use crate::ui::DemoInfoUpdateSystems;
-#[cfg(feature = "egui")]
 use crate::ui::plotting::plot_source_rolling_update;
+#[cfg(feature = "egui")]
+use crate::ui::plugin::DemoInfoUpdateSystems;
+use crate::ui::systems::inspector_ui;
+
+/// Systems that should only run when the editor's play gate is active (or always in standalone).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EditorPlaySet;
+
+/// Systems that require both the play gate to be active AND the game to be unpaused.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActiveGameplaySet;
 
 /// Your game's Bevy plugin. The editor links this so your components
 /// show up in the inspector; the standalone binary adds it too. Gameplay
@@ -67,68 +76,89 @@ use crate::ui::plotting::plot_source_rolling_update;
 pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
+
     fn build(&self, app: &mut App) {
         let app_setup_configuration = AppSetupConfiguration::from_environment();
+
+        // 1. Clone and insert the resource FIRST while the struct is whole
         app.insert_resource(app_setup_configuration.clone());
 
+        // 2. THEN extract the schedule (partially moving it is fine now since we don't need the struct again)
         let schedule = app_setup_configuration.schedule_to_use;
 
-        // --- Physics & Tnua backend (schedule-dependent) ---
+        app.init_state::<GameState>();
+
+        // --- System Sets Configuration ---
+        app.configure_sets(Update, EditorPlaySet.run_if(play_gate::is_playing));
+        app.configure_sets(
+            Update,
+            ActiveGameplaySet
+                .in_set(EditorPlaySet)
+                .run_if(in_state(GameState::Running)),
+        );
+
+        // --- Pause / Unpause Handling ---
+        // Add your toggle system (runs in Update regardless of pause state)
+        app.add_systems(Update, toggle_pause);
+
+        // --- Physics & Tnua backend ---
         app.add_plugins(PhysicsDebugPlugin);
         match schedule {
             ScheduleToUse::Update => {
-                app.add_plugins(PhysicsPlugins::new(PostUpdate));
-                app.add_plugins(TnuaAvian2dPlugin::new(Update));
+                app.add_plugins((
+                    PhysicsPlugins::new(PostUpdate),
+                    TnuaAvian2dPlugin::new(Update),
+                    TnuaControllerPlugin::<DemoControlScheme>::new(Update),
+                    TnuaAirActionsPlugin::<DemoControlSchemeAirActions>::new(Update),
+                ));
             }
             ScheduleToUse::FixedUpdate => {
-                app.add_plugins(PhysicsPlugins::new(FixedPostUpdate));
-                app.add_plugins(TnuaAvian2dPlugin::new(FixedUpdate));
-            }
-        }
-
-        // --- Tnua controller & air actions (schedule-dependent) ---
-        match schedule {
-            ScheduleToUse::Update => {
-                app.add_plugins(TnuaControllerPlugin::<DemoControlScheme>::new(Update));
-                app.add_plugins(TnuaAirActionsPlugin::<DemoControlSchemeAirActions>::new(Update));
-            }
-            ScheduleToUse::FixedUpdate => {
-                app.add_plugins(TnuaControllerPlugin::<DemoControlScheme>::new(FixedUpdate));
-                app.add_plugins(TnuaAirActionsPlugin::<DemoControlSchemeAirActions>::new(FixedUpdate));
+                app.add_plugins((
+                    PhysicsPlugins::new(FixedPostUpdate),
+                    TnuaAvian2dPlugin::new(FixedUpdate),
+                    TnuaControllerPlugin::<DemoControlScheme>::new(FixedUpdate),
+                    TnuaAirActionsPlugin::<DemoControlSchemeAirActions>::new(FixedUpdate),
+                ));
             }
         }
 
         // --- Living and Weapon systems ---
-        app.add_plugins(character_control_systems::WeaponPlugin);
+        app.add_plugins((
+            character_control_systems::WeaponPlugin,
+            character_control_systems::player_input::PlayerInputPlugin,
+            EnemyPlugin,
+            LivingPlugin,
+            OtherControlsPlugin,
+        ));
+
+        // Preserving custom extension trait if applicable
         app.add_message::<FireWeapon>();
-        app.add_plugins(character_control_systems::player_input::PlayerInputPlugin);
-        app.add_plugins((EnemyPlugin, LivingPlugin));
-        app.add_plugins(OtherControlsPlugin);
 
-        // --- Debug / info dumping (egui-gated) ---
-        #[cfg(feature = "egui")]
+        // --- Core Gameplay Systems ---
         app.add_systems(
             Update,
-            character_control_info_dumping_system
-                .in_set(DemoInfoUpdateSystems)
-                .run_if(play_gate::is_playing),
+            (
+                character_control_radar_visualization_system,
+                apply_platformer_controls.in_set(TnuaUserControlsSystems),
+            )
+                .in_set(ActiveGameplaySet),
         );
 
-        app.add_systems(
-            Update,
-            character_control_radar_visualization_system.run_if(play_gate::is_playing),
-        );
-
-        // --- UI & rendering ---
-        #[cfg(feature = "egui")]
-        app.add_systems(Update, plot_source_rolling_update.run_if(play_gate::is_playing));
-
+        // --- UI, Rendering & Debug ---
         app.add_plugins(DemoUi::<DemoControlScheme>::default());
+        app.add_systems(Startup, helper2d::setup_camera);
 
         #[cfg(feature = "egui")]
-        app.add_systems(EguiPrimaryContextPass, inspector_ui);
-
-        app.add_systems(Startup, helper2d::setup_camera);
+        {
+            app.add_systems(EguiPrimaryContextPass, inspector_ui);
+            app.add_systems(Update, plot_source_rolling_update.in_set(EditorPlaySet));
+            app.add_systems(
+                Update,
+                character_control_info_dumping_system
+                    .in_set(DemoInfoUpdateSystems)
+                    .in_set(ActiveGameplaySet),
+            );
+        }
 
         // --- Levels & player ---
         app.add_plugins(
@@ -136,17 +166,14 @@ impl Plugin for GamePlugin {
                 .with_levels(levels_for_2d),
         );
         app.add_plugins(PlayerPlugin);
-        app.add_systems(
-            Update,
-            apply_platformer_controls
-                .in_set(TnuaUserControlsSystems)
-                .run_if(play_gate::is_playing),
-        );
 
         // --- Game mechanics ---
         app.add_plugins((LevelMechanicsPlugin, JustPressedCachePlugin));
+
         // --- Particles ---
-        app.add_plugins(HanabiPlugin);
+        app.add_plugins((HanabiPlugin, ParticlePlugin));
+        app.add_systems(OnEnter(GameState::Paused), pause_particle_spawners);
+        app.add_systems(OnEnter(GameState::Running), unpause_particle_spawners);
     }
 }
 
@@ -166,31 +193,3 @@ pub mod play_gate {
         true
     }
 }
-
-#[cfg(feature = "egui")]
-pub fn inspector_ui(world: &mut World) {
-    let mut context_query =
-        world.query_filtered::<&mut EguiContext, With<PrimaryEguiContext>>();
-
-    let Ok(egui_context) = context_query.single_mut(world) else {
-        return;
-    };
-
-    // Clone the component handle so the query no longer borrows the world
-    // while the inspector itself accesses it.
-    let mut egui_context = egui_context.clone();
-
-    egui::Window::new("Inspector").show(egui_context.get_mut(), |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            bevy_inspector_egui::bevy_inspector::ui_for_world(world, ui);
-
-            egui::CollapsingHeader::new("Materials").show(ui, |ui| {
-                bevy_inspector_egui::bevy_inspector::ui_for_assets::<StandardMaterial>(
-                    world, ui,
-                );
-            });
-        });
-    });
-}
-
-

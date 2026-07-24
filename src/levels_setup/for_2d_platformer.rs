@@ -2,11 +2,9 @@
 
 use bevy::{color::palettes::css, prelude::*};
 
-#[cfg(feature = "avian2d")]
 use avian2d::prelude::*;
 use bevy_tnua::TnuaGhostPlatform;
-#[allow(unused_imports)]
-use bevy_tnua::math::{AdjustPrecision, Vector2, Vector3};
+use bevy_tnua::math::{Vector2, Vector3};
 
 use crate::level_mechanics::MovingPlatform;
 

@@ -1,39 +1,50 @@
+use std::cmp::PartialEq;
 use bevy::ecs::query::QuerySingleError;
 use bevy::prelude::*;
 
-use bevy::input::ButtonState;
-use bevy::input::keyboard::KeyboardInput;
 use bevy::window::PrimaryWindow;
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use leafwing_input_manager::prelude::*;
 #[cfg(feature = "egui")]
 use bevy_egui::EguiContexts;
 use glamour::Vector2;
 use crate::living::player::IsPlayer;
 use crate::living::{CharacterSprite, flip_sprite_for_direction};
-use crate::living::weapon_shooting::{FireWeapon, Weapon, WeaponInventory, FireRate, WeaponKind, rotate_active_weapon, WeaponOffset};
+use crate::living::weapon_shooting::{FireWeapon, Weapon, WeaponInventory, FireRate, WeaponKind, rotate_active_weapon, WeaponOffset, WeaponIntent};
+use crate::util::game_states::GameState;
 use crate::util::units::{BevyVec2Ext, CartesianSpace, Vector2Ext, WindowSpace};
+
+#[derive(Actionlike, PartialEq, Eq, Hash, Clone, Copy, Debug, Reflect)]
+pub enum PlayerAction {
+    Fire,
+    CycleNext,
+    CyclePrev,
+}
 
 pub struct PlayerInputPlugin;
 
 impl Plugin for PlayerInputPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_debug_text);
+        app.add_plugins(InputManagerPlugin::<PlayerAction>::default());
+        app.add_systems(Startup, setup_ui_text);
         app.add_systems(Update, (
             player_weapon_face_mouse,
             player_fire_input,
-            mouse_wheel_switch,
+            player_cycle_weapon,
             flip_sprite_to_mouse,
-            update_debug_text,
+        ).run_if(in_state(GameState::Running)));
+
+        // --- Debug Systems ---
+        app.add_systems(Update, (
+            update_weapon_selection_text,
             debug_player_components,
         ));
     }
 }
 
 pub fn player_fire_input(
-    mouse: Res<ButtonInput<MouseButton>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<Camera2d>>,
-    players: Query<(Entity, &Transform, Option<&FireRate>), (With<IsPlayer>, With<Weapon>)>,
+    players: Query<(Entity, &Transform, Option<&FireRate>, &ActionState<PlayerAction>), (With<IsPlayer>, With<Weapon>)>,
     mut fire_messages: MessageWriter<FireWeapon>,
     #[cfg(feature = "egui")]
     mut egui_contexts: EguiContexts,
@@ -46,8 +57,7 @@ pub fn player_fire_input(
         .map(|ctx| ctx.egui_wants_pointer_input())
         .unwrap_or(false);
 
-    if !mouse.pressed(MouseButton::Left) || egui_wants_pointer_input {
-        // Do not fire when the button is released or egui is consuming pointer input.
+    if egui_wants_pointer_input {
         return;
     }
 
@@ -60,11 +70,24 @@ pub fn player_fire_input(
     };
     let world_pos = ray.origin.truncate();
 
-    for (entity, transform, fire_rate) in &players {
-        // Respect fire rate cooldown if the weapon has one.
-        if let Some(fr) = fire_rate {
-            if !fr.0.is_finished() {
-                continue;
+    for (entity, transform, fire_rate, action_state) in &players {
+        // 1. Determine the intent from state transitions
+        let intent = if action_state.just_pressed(&PlayerAction::Fire) {
+            WeaponIntent::BeginHold
+        } else if action_state.just_released(&PlayerAction::Fire) {
+            WeaponIntent::ReleaseHold
+        } else if action_state.pressed(&PlayerAction::Fire) {
+            WeaponIntent::ContinueHold
+        } else {
+            continue; // Action is inactive this tick
+        };
+
+        // 2. Bypass fire rate check on release so release events aren't dropped
+        if intent != WeaponIntent::ReleaseHold {
+            if let Some(fr) = fire_rate {
+                if !fr.0.is_finished() {
+                    continue;
+                }
             }
         }
 
@@ -74,6 +97,7 @@ pub fn player_fire_input(
                 wielder: entity,
                 origin: transform.translation,
                 direction: Dir2::new(dir).unwrap(),
+                intent,
             });
         }
     }
@@ -90,7 +114,6 @@ pub fn player_weapon_face_mouse(
         (&mut Transform, &WeaponOffset),
     >,
 ) {
-
     let (cam, cam_tf) = *camera;
 
     let player_pos = player_q
@@ -109,7 +132,6 @@ pub fn player_weapon_face_mouse(
                     println!("Failed to get weapon: 0 entities matched the query.");
                 }
                 QuerySingleError::MultipleEntities(_) => {
-                    // If multiple entities exist, count them accurately using .iter()
                     let total_count = weapon_q.iter().count();
                     println!("Failed to get weapon: expected 1, but found {} entities.", total_count);
                 }
@@ -117,15 +139,12 @@ pub fn player_weapon_face_mouse(
             return;
         }
     };
-
-    // Safely get the cursor position. This is optional when the cursor
-    // is outside the window.
+    // --- Guard clause, ensure mouse is on screen.
     let Some(pre_cpos) = window.cursor_position() else {
         return;
     };
 
-    let cpos = Vector2::<WindowSpace>::new(pre_cpos.x, pre_cpos.y);
-    //info!("cpos: {:?}", cpos.to_bevy());
+    let cpos = pre_cpos.to_space::<WindowSpace>();
     let Ok(raw_world_cpos) = cam.viewport_to_world_2d(cam_tf, cpos.to_bevy()) else {
         return;
     };
@@ -138,14 +157,13 @@ pub fn player_weapon_face_mouse(
     rotate_active_weapon(&mut wep_tf, aim_angle);
 }
 
-pub fn mouse_wheel_switch(
-    mut mouse_wheel_messages: MessageReader<MouseWheel>,
-    mut keyboard_input: MessageReader<KeyboardInput>,
-    mut inventory: Query<&mut WeaponInventory, (With<IsPlayer>, With<Weapon>)>,
+pub fn player_cycle_weapon(
+    mut inventory_q: Query<(&mut WeaponInventory, &ActionState<PlayerAction>), (With<IsPlayer>, With<Weapon>)>,
     #[cfg(feature = "egui")]
     mut egui_contexts: EguiContexts,
 ) {
-    let Ok(mut inv) = inventory.single_mut() else { return };
+    let Ok((mut inv, action_state)) = inventory_q.single_mut() else { return };
+
     #[cfg(not(feature = "egui"))]
     let egui_wants_pointer_input = false;
     #[cfg(feature = "egui")]
@@ -157,27 +175,12 @@ pub fn mouse_wheel_switch(
     if egui_wants_pointer_input {
         return;
     }
-    // --- Mouse wheel ---
-    for event in mouse_wheel_messages.read() {
-        if event.unit == MouseScrollUnit::Line {
-            if event.y > 0.0 {
-                inv.cycle(true);
-            } else if event.y < 0.0 {
-                inv.cycle(false);
-            }
-        }
-    }
 
-    // --- Keyboard ---
-    for event in keyboard_input.read() {
-        if event.state != ButtonState::Pressed {
-            continue;
-        }
-        match event.key_code {
-            KeyCode::BracketLeft  => inv.cycle(false),
-            KeyCode::BracketRight => inv.cycle( true),
-            _ => {}
-        }
+    if action_state.just_pressed(&PlayerAction::CycleNext) {
+        inv.cycle(true);
+    }
+    if action_state.just_pressed(&PlayerAction::CyclePrev) {
+        inv.cycle(false);
     }
 }
 
@@ -192,7 +195,6 @@ pub fn flip_sprite_to_mouse(
         return;
     };
 
-    // Convert screen-space cursor to world-space
     let Ok(world_pos) = camera.viewport_to_world_2d(camera_transform, cursor_position) else {
         return;
     };
@@ -200,7 +202,6 @@ pub fn flip_sprite_to_mouse(
     for (parent, mut sprite) in player_sprite_query.iter_mut() {
         if let Ok(player_transform) = player_query.get(parent.0) {
             let player_x = player_transform.translation().x;
-            // Flip sprite: true = face left, false = face right
             flip_sprite_for_direction(&mut sprite, world_pos.x - player_x);
         }
     }
@@ -211,7 +212,7 @@ pub fn flip_sprite_to_mouse(
 #[derive(Component)]
 pub struct DebugTextTag;
 
-pub fn setup_debug_text(mut commands: Commands) {
+pub fn setup_ui_text(mut commands: Commands) {
     commands.spawn((
         Text::new("Weapon Status: Unknown"),
         TextFont {
@@ -228,14 +229,12 @@ pub fn setup_debug_text(mut commands: Commands) {
     ));
 }
 
-pub fn update_debug_text(
+pub fn update_weapon_selection_text(
     player_query: Query<Option<&WeaponKind>, With<IsPlayer>>,
     mut text_query: Query<&mut Text, With<DebugTextTag>>,
 ) {
     let Ok(mut text) = text_query.single_mut() else { return };
 
-    // get_single() safely returns an error if the player hasn't spawned yet
-    // or if there are multiple players, avoiding panics.
     let Ok(weapon_kind_opt) = player_query.single() else { return };
 
     match weapon_kind_opt {

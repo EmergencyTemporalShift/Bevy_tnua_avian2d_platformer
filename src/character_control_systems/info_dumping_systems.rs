@@ -85,7 +85,7 @@ pub fn character_control_radar_visualization_system(
     spatial_ext: SpatialExtFacade,
     mut gizmos: Gizmos,
 ) {
-    if true {
+    if false {
         // Don't show the gizmos
         return;
     }

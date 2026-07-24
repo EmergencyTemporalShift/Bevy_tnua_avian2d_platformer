@@ -7,12 +7,13 @@ use bevy_tnua::{
     TnuaGhostOverwrites, TnuaObstacleRadar, TnuaToggle,
 };
 use bevy_tnua::control_helpers::{TnuaBlipReuseAvoidance, TnuaSimpleFallThroughPlatformsHelper};
+use leafwing_input_manager::prelude::*;
 use crate::character_control_systems::Dimensionality;
 use crate::character_control_systems::platformer_control_scheme::{
     DemoControlScheme, DemoControlSchemeConfig,
 };
 use crate::character_control_systems::platformer_control_systems::CharacterMotionConfigForPlatformerDemo;
-
+use crate::character_control_systems::player_input::PlayerAction;
 use crate::levels_setup::for_2d_platformer::LayerNames;
 use crate::ui::component_alteration::CommandAlteringSelectors;
 use crate::living::{spawn_living, weapon_shooting, CharacterPhysicsConfig, CharacterVisualConfig, Team};
@@ -21,7 +22,7 @@ use crate::living::{spawn_living, weapon_shooting, CharacterPhysicsConfig, Chara
 use crate::ui::info::InfoSource;
 #[cfg(feature = "egui")]
 use crate::ui::plotting::PlotSource;
-use crate::ui::TrackedEntity;
+use crate::ui::components::TrackedEntity;
 
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
@@ -46,7 +47,7 @@ pub fn setup_player(
         &mut commands,
         &asset_server,
         &mut texture_atlas_layouts,
-        "Player",
+        "Ambrosia",
         CharacterVisualConfig {
             texture_path: "Witchcraft_Sprites/Witchcraft_spr_1.png",
             tile_size: UVec2::new(24, 24),
@@ -62,6 +63,18 @@ pub fn setup_player(
         },
         |cmd| {
             cmd.insert((IsPlayer, Team::Player));
+
+            // Replace the old command block with this:
+            cmd.insert((
+                InputMap::default()
+                    .with(PlayerAction::Fire, MouseButton::Left)
+                    .with(PlayerAction::CyclePrev, KeyCode::BracketLeft)
+                    .with(PlayerAction::CycleNext, KeyCode::BracketRight)
+                    // Add your mouse scroll bindings here if using them:
+                    .with(PlayerAction::CycleNext, MouseScrollDirection::UP)
+                    .with(PlayerAction::CyclePrev, MouseScrollDirection::DOWN),
+                ActionState::<PlayerAction>::default(),
+            ));
 
             // `TnuaController` is Tnua's main interface with the user code. Read
             // examples/src/character_control_systems/platformer_control_systems.rs to see how
@@ -188,7 +201,7 @@ pub fn setup_player(
                         HeavyBow,
                         Beam,
                     ],
-                    active: 2,
+                    active: 3,
                 },
                 weapon,
                 kind,

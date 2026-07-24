@@ -1,4 +1,13 @@
 use bevy::{app::AppExit, prelude::*};
+use leafwing_input_manager::prelude::*;
+use crate::util::game_states::GameState;
+
+#[derive(Actionlike, PartialEq, Eq, Hash, Clone, Copy, Debug, Reflect)]
+pub enum SystemAction {
+    ToggleEgui,
+    Exit,
+    TogglePause,
+}
 
 /// State and programmatic controls for non-player actions.
 #[derive(Resource, Debug, Clone, Copy)]
@@ -47,20 +56,55 @@ pub struct OtherControlsPlugin;
 impl Plugin for OtherControlsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OtherControls>()
+            .add_plugins(InputManagerPlugin::<SystemAction>::default())
+            .add_systems(Startup, setup_system_controls)
             .add_systems(Update, handle_non_player_controls);
     }
 }
 
+// Spawns a dedicated entity to hold our global system inputs
+fn setup_system_controls(mut commands: Commands) {
+    commands.spawn((
+        InputMap::new([
+            (SystemAction::ToggleEgui, KeyCode::F1),
+            (SystemAction::Exit, KeyCode::Escape),
+            (SystemAction::TogglePause, KeyCode::KeyP), // Temporary, we'll get a menu eventually.
+        ]),
+        ActionState::<SystemAction>::default(),
+    ));
+}
+
 fn handle_non_player_controls(
-    keyboard: Res<ButtonInput<KeyCode>>,
+    // Query the component instead of requesting a resource
+    action_state_q: Query<&ActionState<SystemAction>>,
     mut controls: ResMut<OtherControls>,
     mut exit_events: MessageWriter<AppExit>,
+    current_state: Res<State<GameState>>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut time: ResMut<Time<Virtual>>,
 ) {
-    if keyboard.just_pressed(KeyCode::F1) {
+    let Ok(action_state) = action_state_q.single() else {
+        return;
+    };
+
+    if action_state.just_pressed(&SystemAction::ToggleEgui) {
         controls.toggle_egui();
     }
 
-    if keyboard.just_pressed(KeyCode::Escape) {
+    if action_state.just_pressed(&SystemAction::Exit) {
         OtherControls::exit(&mut exit_events);
+    }
+
+    if action_state.just_pressed(&SystemAction::TogglePause) {
+        match current_state.get() {
+            GameState::Running => {
+                next_state.set(GameState::Paused);
+                time.pause();
+            }
+            GameState::Paused => {
+                next_state.set(GameState::Running);
+                time.unpause();
+            }
+        }
     }
 }

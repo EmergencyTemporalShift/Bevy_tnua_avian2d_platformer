@@ -1,3 +1,4 @@
+use avian2d::prelude::LinearVelocity;
 use bevy::ecs::schedule::ScheduleConfigs;
 use bevy::ecs::system::ScheduleSystem;
 use bevy::prelude::*;
@@ -7,11 +8,10 @@ pub struct MovingPlatformPlugin;
 
 impl Plugin for MovingPlatformPlugin {
     fn build(&self, app: &mut App) {
-        #[cfg(feature = "avian2d")]
         app.add_systems(
             Update,
             MovingPlatform::make_system(
-                |velocity: &mut avian2d::prelude::LinearVelocity, linvel: Vector3| {
+                |velocity: &mut LinearVelocity, linvel: Vector3| {
                     velocity.0 = linvel.truncate();
                 },
             ),
